@@ -98,6 +98,20 @@ class BLELabelPrinter(LabelPrintingMixin, SettingsMixin, InvenTreePlugin):
             'validator': bool,
             'default': False,
         },
+        'FILL_MODE': {
+            'name': _('Fill mode'),
+            'description': _(
+                'Default mapping of the label image onto the paper'
+            ),
+            'choices': [
+                ('stretch', 'Stretch'),
+                ('fit', 'Fit'),
+                ('fill', 'Fill'),
+                ('center', 'Center'),
+                ('tile', 'Tile'),
+            ],
+            'default': 'stretch',
+        },
         'DEVICE_NAME': {
             'name': _('Device name filter (optional)'),
             'description': _(
@@ -217,6 +231,7 @@ class BLELabelPrinter(LabelPrintingMixin, SettingsMixin, InvenTreePlugin):
             'feed_mm': self._get_float('FEED_MM', 0.0),
             'threshold': self._get_int('THRESHOLD', 128),
             'invert': self._get_bool('INVERT'),
+            'fill_mode': self._get_setting('FILL_MODE') or 'stretch',
             'deviceName': self._get_setting('DEVICE_NAME') or '',
             'chunkSize': self._get_int('CHUNK_SIZE', 200),
             'chunkDelay': self._get_int('CHUNK_DELAY', 15),
@@ -261,6 +276,7 @@ BLE_PRINT_PAGE = """<!DOCTYPE html>
   #print { background: #16a34a; color: #fff; }
   #disconnect { background: #e5e7eb; color: #111; }
   #test-feed { background: #f59e0b; color: #fff; }
+  #save-params { background: #6b7280; color: #fff; }
   input[type=number] { width: 100%; }
   .labels { display: flex; flex-wrap: wrap; gap: 16px; }
   .label { text-align: center; }
@@ -280,7 +296,10 @@ BLE_PRINT_PAGE = """<!DOCTYPE html>
   </div>
 
   <div class="card">
-    <h1 style="font-size:16px;">打印参数</h1>
+    <div class="row" style="justify-content:space-between;">
+      <h1 style="font-size:16px;">打印参数</h1>
+      <button id="save-params">保存参数</button>
+    </div>
     <div class="grid">
       <label>纸张宽 (mm) <input id="p-width" type="number" step="0.1"></label>
       <label>纸张高 (mm) <input id="p-height" type="number" step="0.1"></label>
@@ -353,6 +372,10 @@ $('p-dpi').value = CONFIG.dpi;
 $('p-thr').value = CONFIG.threshold;
 $('p-proto').value = CONFIG.protocol;
 $('p-invert').checked = !!CONFIG.invert;
+$('p-fill').value = CONFIG.fill_mode || 'stretch';
+
+// Restore previously saved parameters (client-side persistence)
+loadSavedParams();
 
 function getParams() {
   return {
@@ -367,6 +390,70 @@ function getParams() {
     protocol: $('p-proto').value,
     fill: $('p-fill').value
   };
+}
+
+function loadSavedParams() {
+  try {
+    const raw = localStorage.getItem('ble-label-printer-params');
+    if (!raw) return false;
+    const s = JSON.parse(raw);
+    if (!s || typeof s !== 'object') return false;
+    if (s.width_mm != null) $('p-width').value = s.width_mm;
+    if (s.height_mm != null) $('p-height').value = s.height_mm;
+    if (s.offset_x != null) $('p-offx').value = s.offset_x;
+    if (s.offset_y != null) $('p-offy').value = s.offset_y;
+    if (s.feed_mm != null) $('p-feed').value = s.feed_mm;
+    if (s.dpi != null) $('p-dpi').value = s.dpi;
+    if (s.threshold != null) $('p-thr').value = s.threshold;
+    if (s.invert != null) $('p-invert').checked = !!s.invert;
+    if (s.protocol) $('p-proto').value = s.protocol;
+    if (s.fill) $('p-fill').value = s.fill;
+    return true;
+  } catch (e) {
+    return false;
+  }
+}
+
+async function saveParams() {
+  const p = getParams();
+  // Always persist to this browser
+  try {
+    localStorage.setItem('ble-label-printer-params', JSON.stringify(p));
+  } catch (e) {}
+
+  // Also persist to the plugin settings (server side)
+  const csrf = (document.cookie.match(/csrftoken=([^;]+)/) || [])[1] || '';
+  const map = {
+    PROTOCOL: p.protocol,
+    DPI: String(p.dpi),
+    OFFSET_X: String(p.offset_x),
+    OFFSET_Y: String(p.offset_y),
+    FEED_MM: String(p.feed_mm),
+    THRESHOLD: String(p.threshold),
+    INVERT: p.invert ? 'True' : 'False',
+    FILL_MODE: p.fill
+  };
+
+  let ok = true;
+  for (const [key, value] of Object.entries(map)) {
+    try {
+      const resp = await fetch('/api/plugins/ble-label-printer/settings/' + key + '/', {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json', 'X-CSRFToken': csrf },
+        body: JSON.stringify({ value: value })
+      });
+      if (!resp.ok) ok = false;
+    } catch (e) {
+      ok = false;
+    }
+  }
+
+  status(
+    ok
+      ? '参数已保存（已持久化到插件设置，下次打印生效）。'
+      : '参数已保存到本浏览器；服务器保存失败（请确认已登录）。',
+    ok ? 'ok' : ''
+  );
 }
 
 function normalizeUuid(u) {
@@ -462,17 +549,15 @@ function renderRaster(gray, w, h, p) {
   const dotsX = Math.max(1, Math.round(p.width_mm / 25.4 * p.dpi));
   const dotsY = Math.max(1, Math.round(p.height_mm / 25.4 * p.dpi));
   const bytesPerRow = Math.ceil(dotsX / 8);
-  const offX = Math.round(p.offset_x / 25.4 * p.dpi);
   const offY = Math.round(p.offset_y / 25.4 * p.dpi);
   const raster = new Uint8Array(bytesPerRow * dotsY);
 
   for (let y = 0; y < dotsY; y++) {
+    const py = y - offY;
     for (let x = 0; x < dotsX; x++) {
-      const px = x - offX;
-      const py = y - offY;
       let isWhite = true;
-      if (px >= 0 && px < dotsX && py >= 0 && py < dotsY) {
-        const m = fillMap(px, py, w, h, dotsX, dotsY, p.fill);
+      if (py >= 0 && py < dotsY) {
+        const m = fillMap(x, py, w, h, dotsX, dotsY, p.fill);
         if (m) {
           isWhite = gray[m.sy * w + m.sx] >= p.threshold;
         }
@@ -500,10 +585,10 @@ function encodeEscPos(raster, dotsX, dotsY, bytesPerRow, feedDots) {
   return new Uint8Array(out);
 }
 
-function encodeTspl(raster, dotsX, dotsY, bytesPerRow, p) {
+function encodeTspl(raster, dotsX, dotsY, bytesPerRow, p, offX) {
   const header = 'SIZE ' + p.width_mm + ' mm,' + p.height_mm + ' mm\\r\\n' +
                  'GAP 0 mm,0 mm\\r\\nDIRECTION 1\\r\\nCLS\\r\\n' +
-                 'BITMAP 0,0,' + bytesPerRow + ',' + dotsY + ',0,';
+                 'BITMAP ' + offX + ',0,' + bytesPerRow + ',' + dotsY + ',0,';
   const hdr = new TextEncoder().encode(header);
   const tail = new TextEncoder().encode('\\r\\nPRINT 1,1\\r\\n');
   const out = new Uint8Array(hdr.length + raster.length + tail.length);
@@ -513,12 +598,33 @@ function encodeTspl(raster, dotsX, dotsY, bytesPerRow, p) {
   return out;
 }
 
+function padLeft(raster, bytesPerRow, dotsY, offX) {
+  const dotsX = bytesPerRow * 8;
+  const newDotsX = dotsX + offX;
+  const newBytesPerRow = Math.ceil(newDotsX / 8);
+  const out = new Uint8Array(newBytesPerRow * dotsY);
+  for (let y = 0; y < dotsY; y++) {
+    for (let x = 0; x < dotsX; x++) {
+      const bit = (raster[y * bytesPerRow + (x >> 3)] >> (7 - (x & 7))) & 1;
+      if (bit) {
+        const nx = x + offX;
+        out[y * newBytesPerRow + (nx >> 3)] |= 0x80 >> (nx & 7);
+      }
+    }
+  }
+  return { raster: out, bytesPerRow: newBytesPerRow, dotsX: newDotsX };
+}
+
 function encodePayload(r, p) {
+  const offX = Math.max(0, Math.round(p.offset_x / 25.4 * p.dpi));
   const proto = (p.protocol || 'ESC/POS').toUpperCase();
-  if (proto === 'TSPL2') return encodeTspl(r.raster, r.dotsX, r.dotsY, r.bytesPerRow, p);
-  if (proto === 'RAW') return r.raster;
+  if (proto === 'TSPL2') return encodeTspl(r.raster, r.dotsX, r.dotsY, r.bytesPerRow, p, offX);
+  const padded = offX > 0
+    ? padLeft(r.raster, r.bytesPerRow, r.dotsY, offX)
+    : { raster: r.raster, bytesPerRow: r.bytesPerRow, dotsX: r.dotsX };
+  if (proto === 'RAW') return padded.raster;
   const feedDots = Math.round(p.feed_mm / 25.4 * p.dpi);
-  return encodeEscPos(r.raster, r.dotsX, r.dotsY, r.bytesPerRow, feedDots);
+  return encodeEscPos(padded.raster, padded.dotsX, r.dotsY, padded.bytesPerRow, feedDots);
 }
 
 // ---- state ----
@@ -694,6 +800,7 @@ $('connect').addEventListener('click', connect);
 $('disconnect').addEventListener('click', disconnect);
 $('print').addEventListener('click', print);
 $('test-feed').addEventListener('click', testFeed);
+$('save-params').addEventListener('click', saveParams);
 $('char-select').addEventListener('change', (ev) => {
   const idx = parseInt(ev.target.value, 10);
   if (!isNaN(idx) && writableChars[idx]) selectedChar = writableChars[idx].characteristic;
