@@ -8,24 +8,30 @@
     * { box-sizing: border-box; margin: 0; padding: 0; }
     html, body { width: 100%; height: 100%; margin: 0; }
     body { font-family: 'DejaVu Sans', Arial, sans-serif; }
-    .label { width: 100%; height: 100%; display: flex; align-items: center; gap: 2mm; padding: 2mm; overflow: hidden; }
-    .left { flex: 1; }
-    .name { font-size: 3.2mm; font-weight: bold; line-height: 1.2; }
-    .meta { font-size: 2.4mm; line-height: 1.35; color: #222; }
-    .qr { width: 15mm; height: 15mm; flex-shrink: 0; }
+    .label { width: 100%; height: 100%; display: flex; flex-direction: column; border: 0.4mm solid #1a1a1a; overflow: hidden; }
+    .head { padding: 1.1mm 1.5mm; font-size: 3.2mm; font-weight: bold; text-align: center; border-bottom: 0.35mm solid #1a1a1a; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .body { flex: 1; display: flex; align-items: center; }
+    .info { flex: 1; min-width: 0; padding: 1.5mm; font-size: 2.3mm; line-height: 1.5; overflow: hidden; }
+    .info .line { display: flex; gap: 1mm; }
+    .info .k { color: #444; flex-shrink: 0; }
+    .info .v { font-weight: bold; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .qrc { flex-shrink: 0; display: flex; align-items: center; justify-content: center; padding: 1.5mm; }
+    .qrc img { width: 12mm; height: 12mm; }
+    .foot { padding: 0.6mm 1.5mm; font-size: 1.9mm; text-align: center; border-top: 0.35mm solid #1a1a1a; color: #333; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 </style>
 </head>
 <body>
 <div class="label">
-  <div class="left">
-    <div class="name">{{ part.name }}</div>
-    <div class="meta">
-      {% if part.IPN %}IPN: {{ part.IPN }}<br>{% endif %}
-      生产单: {{ build.reference }}<br>
-      数量: {% decimal build.quantity %}
+  <div class="head">{{ part.name }}</div>
+  <div class="body">
+    <div class="info">
+      {% if part.IPN %}<div class="line"><span class="k">IPN</span><span class="v">{{ part.IPN }}</span></div>{% endif %}
+      <div class="line"><span class="k">生产单</span><span class="v">{{ build.reference }}</span></div>
+      <div class="line"><span class="k">数量</span><span class="v">{% decimal build.quantity %}</span></div>
     </div>
+    <div class="qrc"><img alt="QR" src="{% qrcode build.barcode border=1 box_size=4 %}"></div>
   </div>
-  <img class="qr" alt="QR" src="{% qrcode build.barcode border=1 box_size=4 %}">
+  <div class="foot">{{ build.reference }}</div>
 </div>
 </body>
 </html>

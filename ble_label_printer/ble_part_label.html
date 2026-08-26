@@ -8,24 +8,30 @@
     * { box-sizing: border-box; margin: 0; padding: 0; }
     html, body { width: 100%; height: 100%; margin: 0; }
     body { font-family: 'DejaVu Sans', Arial, sans-serif; }
-    .label {
-        width: 100%; height: 100%;
-        display: flex; flex-direction: column;
-        align-items: center; justify-content: center;
-        text-align: center; overflow: hidden;
-    }
-    .name { font-size: 3.2mm; font-weight: bold; line-height: 1.2; }
-    .ipn { font-size: 2.6mm; line-height: 1.2; }
-    .desc { font-size: 2mm; color: #555; line-height: 1.2; }
-    .qr { width: 9mm; height: 9mm; margin-top: 1mm; }
+    .label { width: 100%; height: 100%; display: flex; flex-direction: column; border: 0.4mm solid #1a1a1a; overflow: hidden; }
+    .head { padding: 1.1mm 1.5mm; font-size: 3.2mm; font-weight: bold; text-align: center; border-bottom: 0.35mm solid #1a1a1a; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .body { flex: 1; display: flex; align-items: center; }
+    .info { flex: 1; min-width: 0; padding: 1.5mm; font-size: 2.3mm; line-height: 1.5; overflow: hidden; }
+    .info .line { display: flex; gap: 1mm; }
+    .info .k { color: #444; flex-shrink: 0; }
+    .info .v { font-weight: bold; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .qrc { flex-shrink: 0; display: flex; align-items: center; justify-content: center; padding: 1.5mm; }
+    .qrc img { width: 12mm; height: 12mm; }
+    .foot { padding: 0.6mm 1.5mm; font-size: 1.9mm; text-align: center; border-top: 0.35mm solid #1a1a1a; color: #333; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 </style>
 </head>
 <body>
 <div class="label">
-    <div class="name">{{ part.name }}</div>
-    {% if part.IPN %}<div class="ipn">{{ part.IPN }}</div>{% endif %}
-    {% if part.description %}<div class="desc">{{ part.description }}</div>{% endif %}
-    {% if part.IPN %}<img class="qr" alt="QR" src="{% qrcode part.IPN border=1 box_size=4 %}">{% endif %}
+  <div class="head">{{ part.name }}</div>
+  <div class="body">
+    <div class="info">
+      {% if part.IPN %}<div class="line"><span class="k">IPN</span><span class="v">{{ part.IPN }}</span></div>{% endif %}
+      {% if part.description %}<div class="line"><span class="k">描述</span><span class="v">{{ part.description }}</span></div>{% endif %}
+      {% if category %}<div class="line"><span class="k">分类</span><span class="v">{{ category.name }}</span></div>{% endif %}
+    </div>
+    <div class="qrc"><img alt="QR" src="{% qrcode qr_data border=1 box_size=4 %}"></div>
+  </div>
+  <div class="foot">{% if part.IPN %}{{ part.IPN }}{% else %}{{ part.name }}{% endif %}</div>
 </div>
 </body>
 </html>

@@ -22,17 +22,16 @@
 </head>
 <body>
 <div class="label">
-  <div class="head">{{ part.name }}</div>
+  <div class="head">{{ location.name }}</div>
   <div class="body">
     <div class="info">
-      {% if part.IPN %}<div class="line"><span class="k">IPN</span><span class="v">{{ part.IPN }}</span></div>{% endif %}
-      {% if item.serial %}<div class="line"><span class="k">序列号</span><span class="v">{{ item.serial }}</span></div>{% endif %}
-      {% if item.batch %}<div class="line"><span class="k">批号</span><span class="v">{{ item.batch }}</span></div>{% endif %}
-      <div class="line"><span class="k">数量</span><span class="v">{% decimal item.quantity %}</span></div>
+      {% if location.description %}<div class="line"><span class="k">描述</span><span class="v">{{ location.description }}</span></div>{% endif %}
+      {% if parent %}<div class="line"><span class="k">上级</span><span class="v">{{ parent.name }}</span></div>{% endif %}
+      <div class="line"><span class="k">库存项</span><span class="v">{{ stock_items|length }}</span></div>
     </div>
     <div class="qrc"><img alt="QR" src="{% qrcode qr_data border=1 box_size=4 %}"></div>
   </div>
-  <div class="foot">{% if item.serial %}{{ item.serial }}{% else %}{{ part.name }}{% endif %}</div>
+  <div class="foot">{{ location.pathstring }}</div>
 </div>
 </body>
 </html>

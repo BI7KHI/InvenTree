@@ -53,12 +53,13 @@ server {
 
 ## 标签模板
 
-提供 5 个 40mm × 30mm 标签模板（含二维码），对应不同业务对象：
+提供 6 个 40mm × 30mm 标签模板（统一带边框、标题栏、信息区、二维码、底栏的规整布局），对应不同业务对象：
 
 | 文件 | 模型 | 说明 |
 |---|---|---|
-| `ble_part_label.html` | 零件 (part) | 名称 / IPN / 描述 / 二维码 |
+| `ble_part_label.html` | 零件 (part) | 名称 / IPN / 描述 / 分类 / 二维码 |
 | `stock_label.html` | 库存 (stockitem) | 名称 / IPN / 序列号 / 批号 / 数量 / 二维码 |
+| `stocklocation_label.html` | 库存地点 (stocklocation) | 名称 / 描述 / 上级 / 库存项数 / 二维码 |
 | `build_label.html` | 生产 (build) | 名称 / IPN / 生产单号 / 数量 / 二维码 |
 | `purchase_order_label.html` | 采购 (purchaseorder) | 单号 / 供应商 / 描述 / 交期 / 二维码 |
 | `sales_order_label.html` | 销售 (salesorder) | 单号 / 客户 / 描述 / 交期 / 二维码 |
