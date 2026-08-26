@@ -1,0 +1,31 @@
+{% load report %}{% load inventree_extras %}{% load barcode %}
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+    {{ page_style|safe }}
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    html, body { width: 100%; height: 100%; margin: 0; }
+    body { font-family: 'DejaVu Sans', Arial, sans-serif; }
+    .label { width: 100%; height: 100%; display: flex; align-items: center; gap: 2mm; padding: 2mm; overflow: hidden; }
+    .left { flex: 1; }
+    .name { font-size: 3.2mm; font-weight: bold; line-height: 1.2; }
+    .meta { font-size: 2.4mm; line-height: 1.35; color: #222; }
+    .qr { width: 15mm; height: 15mm; flex-shrink: 0; }
+</style>
+</head>
+<body>
+<div class="label">
+  <div class="left">
+    <div class="name">销售单: {{ order.reference }}</div>
+    <div class="meta">
+      {% if customer %}客户: {{ customer.name }}<br>{% endif %}
+      {% if order.description %}{{ order.description }}<br>{% endif %}
+      {% if order.target_date %}交期: {{ order.target_date }}{% endif %}
+    </div>
+  </div>
+  <img class="qr" alt="QR" src="{% qrcode order.barcode border=1 box_size=4 %}">
+</div>
+</body>
+</html>

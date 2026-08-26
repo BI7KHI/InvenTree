@@ -296,6 +296,15 @@ BLE_PRINT_PAGE = """<!DOCTYPE html>
           <option value="RAW">RAW</option>
         </select>
       </label>
+      <label>填充方式
+        <select id="p-fill">
+          <option value="stretch">拉伸</option>
+          <option value="fit">适应</option>
+          <option value="fill">填充</option>
+          <option value="center">居中</option>
+          <option value="tile">平铺</option>
+        </select>
+      </label>
       <label class="check"><input id="p-invert" type="checkbox"> 反色</label>
     </div>
   </div>
@@ -355,7 +364,8 @@ function getParams() {
     dpi: parseInt($('p-dpi').value) || 203,
     threshold: parseInt($('p-thr').value) || 128,
     invert: $('p-invert').checked,
-    protocol: $('p-proto').value
+    protocol: $('p-proto').value,
+    fill: $('p-fill').value
   };
 }
 
@@ -422,6 +432,32 @@ async function loadGrayscale(b64) {
 }
 
 // ---- rendering ----
+function fillMap(px, py, w, h, dotsX, dotsY, mode) {
+  let sx, sy;
+  if (mode === 'fit') {
+    const s = Math.min(dotsX / w, dotsY / h);
+    sx = (px - (dotsX - w * s) / 2) / s;
+    sy = (py - (dotsY - h * s) / 2) / s;
+  } else if (mode === 'fill') {
+    const s = Math.max(dotsX / w, dotsY / h);
+    sx = (px - (dotsX - w * s) / 2) / s;
+    sy = (py - (dotsY - h * s) / 2) / s;
+  } else if (mode === 'center') {
+    sx = px - (dotsX - w) / 2;
+    sy = py - (dotsY - h) / 2;
+  } else if (mode === 'tile') {
+    sx = ((px % w) + w) % w;
+    sy = ((py % h) + h) % h;
+  } else {
+    // stretch (default)
+    sx = px * w / dotsX;
+    sy = py * h / dotsY;
+  }
+  const ix = Math.floor(sx), iy = Math.floor(sy);
+  if (ix < 0 || ix >= w || iy < 0 || iy >= h) return null;
+  return { sx: ix, sy: iy };
+}
+
 function renderRaster(gray, w, h, p) {
   const dotsX = Math.max(1, Math.round(p.width_mm / 25.4 * p.dpi));
   const dotsY = Math.max(1, Math.round(p.height_mm / 25.4 * p.dpi));
@@ -431,14 +467,15 @@ function renderRaster(gray, w, h, p) {
   const raster = new Uint8Array(bytesPerRow * dotsY);
 
   for (let y = 0; y < dotsY; y++) {
-    const sy = y - offY;
     for (let x = 0; x < dotsX; x++) {
-      const sx = x - offX;
+      const px = x - offX;
+      const py = y - offY;
       let isWhite = true;
-      if (sx >= 0 && sx < dotsX && sy >= 0 && sy < dotsY) {
-        const cx = Math.min(w - 1, Math.floor(sx * w / dotsX));
-        const cy = Math.min(h - 1, Math.floor(sy * h / dotsY));
-        isWhite = gray[cy * w + cx] >= p.threshold;
+      if (px >= 0 && px < dotsX && py >= 0 && py < dotsY) {
+        const m = fillMap(px, py, w, h, dotsX, dotsY, p.fill);
+        if (m) {
+          isWhite = gray[m.sy * w + m.sx] >= p.threshold;
+        }
       }
       let bit = isWhite ? 0 : 1;
       if (p.invert) bit = 1 - bit;
@@ -662,7 +699,7 @@ $('char-select').addEventListener('change', (ev) => {
   if (!isNaN(idx) && writableChars[idx]) selectedChar = writableChars[idx].characteristic;
 });
 
-['p-width', 'p-height', 'p-offx', 'p-offy', 'p-feed', 'p-dpi', 'p-thr', 'p-proto'].forEach(id => {
+['p-width', 'p-height', 'p-offx', 'p-offy', 'p-feed', 'p-dpi', 'p-thr', 'p-proto', 'p-fill'].forEach(id => {
   $(id).addEventListener('input', refresh);
 });
 $('p-invert').addEventListener('change', refresh);
