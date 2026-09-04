@@ -4,6 +4,7 @@ from base64 import b64encode
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
+from django.contrib.auth import get_user_model
 from django.core.exceptions import AppRegistryNotReady
 from django.test import TestCase
 from django.urls import reverse
@@ -15,6 +16,7 @@ from InvenTree.api_version import INVENTREE_API_VERSION
 from InvenTree.exceptions import exception_handler
 from InvenTree.unit_test import InvenTreeAPITestCase, InvenTreeTestCase
 from InvenTree.version import inventreeApiText, parse_version_text
+from users.models import ApiToken
 from users.ruleset import RULESET_NAMES
 from users.tasks import update_group_roles
 
@@ -400,6 +402,9 @@ class SearchTests(InvenTreeAPITestCase):
 
     def test_search_filters(self):
         """Test that the regex, whole word, and notes filters are handled correctly."""
+        from build.models import Build
+        from common.models import Note
+
         SEARCH_TERM = 'some note'
         RE_SEARCH_TERM = 'some (.*) note'
 
@@ -408,9 +413,19 @@ class SearchTests(InvenTreeAPITestCase):
             {'search': SEARCH_TERM, 'limit': 10, 'part': {}, 'build': {}},
             expected_code=200,
         )
+
         # No build or part results
         self.assertEqual(response.data['build']['count'], 0)
         self.assertEqual(response.data['part']['count'], 0)
+
+        # Add a "note" to a build
+        build = Build.objects.first()
+
+        _note = Note.objects.create(
+            content='<html><body>some note</body></html>',
+            model_id=build.id,
+            model_type=build.get_content_type(),
+        )
 
         # add the search_notes param
         response = self.post(
@@ -424,8 +439,9 @@ class SearchTests(InvenTreeAPITestCase):
             },
             expected_code=200,
         )
+
         # now should have some build results
-        self.assertEqual(response.data['build']['count'], 4)
+        self.assertEqual(response.data['build']['count'], 1)
 
         # use the regex term
         response = self.post(
@@ -456,7 +472,7 @@ class SearchTests(InvenTreeAPITestCase):
             expected_code=200,
         )
         # we get our results back!
-        self.assertEqual(response.data['build']['count'], 4)
+        self.assertEqual(response.data['build']['count'], 1)
 
         # add the search_whole param
         response = self.post(
@@ -473,6 +489,43 @@ class SearchTests(InvenTreeAPITestCase):
         )
         # No results again
         self.assertEqual(response.data['build']['count'], 0)
+
+    def test_search_notes_distinct(self):
+        """Test that search_notes does not return duplicate results for multi-note instances.
+
+        notes_list__content traverses a reverse one-to-many relation (an instance can have
+        multiple notes) - without deduplicating the queryset, an instance with 2+ matching
+        notes is returned once per matching note instead of once overall.
+        """
+        from build.models import Build
+        from common.models import Note
+
+        SEARCH_TERM = 'multi note match'
+
+        build = Build.objects.first()
+        content_type = build.get_content_type()
+
+        # Two separate notes on the same build, both matching the search term
+        Note.objects.create(
+            content=f'<p>first {SEARCH_TERM}</p>',
+            model_id=build.id,
+            model_type=content_type,
+        )
+        Note.objects.create(
+            content=f'<p>second {SEARCH_TERM}</p>',
+            model_id=build.id,
+            model_type=content_type,
+        )
+
+        response = self.post(
+            reverse('api-search'),
+            {'search': SEARCH_TERM, 'limit': 10, 'search_notes': True, 'build': {}},
+            expected_code=200,
+        )
+
+        # The build must be returned exactly once, not once per matching note
+        self.assertEqual(response.data['build']['count'], 1)
+        self.assertEqual(len(response.data['build']['results']), 1)
 
     def test_permissions(self):
         """Test that users with insufficient permissions are handled correctly."""
@@ -678,3 +731,56 @@ class GeneralApiTests(InvenTreeAPITestCase):
         self.assertIn('bom-exporter', keys)
         self.assertIn('inventree-ui-notification', keys)
         self.assertIn('inventreelabel', keys)
+
+    def test_generic_metadata_lookup_field_injection(self):
+        """The generic metadata endpoint must not accept arbitrary lookup expressions.
+
+        Regression test for a vulnerability where 'lookup_field' was passed
+        straight from the URL into the ORM (e.g. 'key__regex'), letting an
+        unprivileged user turn distinguishable 403 / 404 / 500 responses into
+        an oracle to recover another user's raw API token, byte by byte.
+        """
+        victim = get_user_model().objects.create_user(
+            username='metadata_victim', password='hunter2', email='victim@example.org'
+        )
+        token = ApiToken.objects.create(user=victim)
+
+        def lookup_url(model, lookup_field, lookup_value):
+            return reverse(
+                'api-generic-metadata',
+                kwargs={
+                    'model': model,
+                    'lookup_field': lookup_field,
+                    'lookup_value': lookup_value,
+                },
+            )
+
+        # A pattern which *would* match the victim's token if 'key__regex'
+        # were actually applied as a regex filter against ApiToken.key
+        matching_pattern = f'^{token.key}$'
+        non_matching_pattern = '^this-will-never-match-anything$'
+
+        responses = set()
+
+        for pattern in (matching_pattern, non_matching_pattern):
+            for lookup_field in ('key__regex', 'key__contains', 'key__startswith'):
+                response = self.get(
+                    lookup_url('apitoken', lookup_field, pattern), expected_code=400
+                )
+                self.assertIn('Invalid lookup field', str(response.data))
+                responses.add(response.status_code)
+
+        # Matching and non-matching patterns must be indistinguishable
+        self.assertEqual(len(responses), 1)
+
+        # The exact-match 'key' lookup stays permitted (used elsewhere, e.g.
+        # by plugin config lookups) - a non-admin still can't read another
+        # user's token metadata through it, since object permissions apply.
+        self.get(lookup_url('apitoken', 'key', token.key), expected_code=403)
+
+        # Not apitoken-specific: any model/lookup-type combination outside
+        # the allow-list is rejected the same way.
+        response = self.get(
+            lookup_url('user', 'password__startswith', 'x'), expected_code=400
+        )
+        self.assertIn('Invalid lookup field', str(response.data))

@@ -467,8 +467,8 @@ class Part(
     InvenTree.models.InvenTreeParameterMixin,
     InvenTree.models.InvenTreeAttachmentMixin,
     InvenTree.models.InvenTreeBarcodeMixin,
+    InvenTree.models.InvenTreeNoteMixin,
     InvenTree.models.InvenTreeTagsMixin,
-    InvenTree.models.InvenTreeNotesMixin,
     report.mixins.InvenTreeReportMixin,
     InvenTree.models.InvenTreeImageMixin,
     InvenTree.models.MetadataMixin,
@@ -4101,6 +4101,11 @@ class BomItem(InvenTree.models.MetadataMixin, InvenTree.models.InvenTreeModel):
             # If the value is None, use an empty string
             if value is None:
                 value = ''
+
+            if field == 'piece_count' and value == 1:
+                # Ignore the piece_count field if it is 1 (default value)
+                # This is to ensure backwards compatibility with BOM checksums calculated before this field was added
+                continue
 
             # Normalize decimal values to ensure consistent representation
             # These values are only included if they are non-zero
