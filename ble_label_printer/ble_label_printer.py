@@ -14,6 +14,28 @@ BLE printer without hardcoded UUIDs.
 
 The Web Bluetooth API requires a secure context, so the InvenTree site must be
 served over HTTPS (or localhost) for this to work.
+
+Multi-label jobs
+----------------
+The plugin used to emit ``ESC @`` (reset) before *every* label.  BLE writes
+are fast relative to the printer's mechanics, so the reset of label N+1 often
+reached the printer while label N was still being printed.  ESC/POS ``ESC @``
+clears the print buffer, so the tail of label N was discarded and the FF that
+followed ejected a half-printed label - exactly the "first label fine, every
+following label truncated" symptom.
+
+The printer page now:
+
+* sends ``ESC @`` **once per job** (optional legacy per-label reset),
+* uses acknowledged GATT writes (``writeValue``) by default, which pace the
+  host to the printer's buffer instead of fire-and-forget
+  ``writeValueWithoutResponse``,
+* waits between labels and can split the bitmap into bands, and
+* logs per-label byte counts / durations so future issues can be diagnosed.
+
+The protocol/transport logic lives in :data:`BLE_CORE_JS`, a pure JavaScript
+module that is embedded into the generated page.  It has no DOM dependency and
+is covered by the Node test-suite in ``tests/``.
 """
 
 import base64
@@ -37,7 +59,7 @@ class BLELabelPrinter(LabelPrintingMixin, SettingsMixin, InvenTreePlugin):
         'Print labels to a Bluetooth Low Energy label printer via the browser '
         '(Web Bluetooth API)'
     )
-    VERSION = '0.4.0'
+    VERSION = '0.5.2'
     AUTHOR = _('InvenTree contributors')
 
     BLOCKING_PRINT = True
@@ -81,6 +103,15 @@ class BLELabelPrinter(LabelPrintingMixin, SettingsMixin, InvenTreePlugin):
             'validator': float,
             'default': 0.0,
         },
+        'GAP_MM': {
+            'name': _('Label gap [mm]'),
+            'description': _(
+                'Gap between die-cut labels. Only used by the TSPL2 protocol '
+                '(GAP command). ESC/POS uses the printer gap sensor via FF.'
+            ),
+            'validator': float,
+            'default': 2.0,
+        },
         'THRESHOLD': {
             'name': _('Binarization threshold'),
             'description': _(
@@ -120,17 +151,70 @@ class BLELabelPrinter(LabelPrintingMixin, SettingsMixin, InvenTreePlugin):
             ),
             'default': '',
         },
-        'CHUNK_SIZE': {
-            'name': _('Write chunk size'),
-            'description': _('Number of bytes written per BLE write operation'),
-            'validator': int,
-            'default': 200,
+        'WRITE_MODE': {
+            'name': _('BLE write mode'),
+            'description': _(
+                'How data is written to the printer. "Auto" prefers acknowledged '
+                'writes (write with response), which provide flow control and '
+                'prevent dropped bytes on multi-label jobs. Use "noack" only if '
+                'the printer rejects write requests.'
+            ),
+            'choices': [
+                ('auto', 'Auto (prefer acknowledged)'),
+                ('ack', 'Acknowledged (write with response)'),
+                ('noack', 'Write without response'),
+            ],
+            'default': 'auto',
         },
-        'CHUNK_DELAY': {
+        'WRITE_CHUNK_SIZE': {
+            'name': _('Write chunk size'),
+            'description': _(
+                'Number of bytes written per BLE write operation. 180 is a safe '
+                'default for both acknowledged and unacknowledged writes.'
+            ),
+            'validator': int,
+            'default': 180,
+        },
+        'WRITE_CHUNK_DELAY': {
             'name': _('Inter-chunk delay'),
-            'description': _('Delay in milliseconds between BLE write chunks'),
+            'description': _(
+                'Delay in milliseconds between BLE write chunks. The acknowledged '
+                'mode already adds the GATT round-trip time; 15 ms is a safe margin '
+                'for slow printer firmware.'
+            ),
             'validator': int,
             'default': 15,
+        },
+        'INTER_LABEL_DELAY': {
+            'name': _('Inter-label delay [ms]'),
+            'description': _(
+                'Delay between two labels. Gives the printer time to finish '
+                'printing / feeding before the next bitmap is pushed. Increase '
+                'this if only the first label of a job prints completely.'
+            ),
+            'validator': int,
+            'default': 800,
+        },
+        'BAND_ROWS': {
+            'name': _('Band height [rows]'),
+            'description': _(
+                'Split each label bitmap into bands of this many rows '
+                '(0 = send the whole label as one bitmap). Useful for printers '
+                'with a very small receive buffer.'
+            ),
+            'validator': int,
+            'default': 0,
+        },
+        'RESET_EACH_LABEL': {
+            'name': _('Reset before every label'),
+            'description': _(
+                'Send ESC @ before each label (legacy behaviour). Usually NOT '
+                'needed and known to truncate multi-label jobs, because the '
+                'reset can reach the printer while the previous label is still '
+                'printing.'
+            ),
+            'validator': bool,
+            'default': False,
         },
     }
 
@@ -229,15 +313,21 @@ class BLELabelPrinter(LabelPrintingMixin, SettingsMixin, InvenTreePlugin):
             'offset_x': self._get_float('OFFSET_X', 0.0),
             'offset_y': self._get_float('OFFSET_Y', 0.0),
             'feed_mm': self._get_float('FEED_MM', 0.0),
+            'gap_mm': self._get_float('GAP_MM', 2.0),
             'threshold': self._get_int('THRESHOLD', 128),
             'invert': self._get_bool('INVERT'),
             'fill_mode': self._get_setting('FILL_MODE') or 'stretch',
             'deviceName': self._get_setting('DEVICE_NAME') or '',
-            'chunkSize': self._get_int('CHUNK_SIZE', 200),
-            'chunkDelay': self._get_int('CHUNK_DELAY', 15),
+            'write_mode': self._get_setting('WRITE_MODE') or 'auto',
+            'chunk_size': self._get_int('WRITE_CHUNK_SIZE', 180),
+            'chunk_delay': self._get_int('WRITE_CHUNK_DELAY', 15),
+            'inter_label_delay': self._get_int('INTER_LABEL_DELAY', 800),
+            'band_rows': self._get_int('BAND_ROWS', 0),
+            'reset_each_label': self._get_bool('RESET_EACH_LABEL'),
         }
 
-        html = BLE_PRINT_PAGE.replace('__BLE_CONFIG__', self._json_safe(config))
+        html = BLE_PRINT_PAGE.replace('__BLE_CORE_JS__', BLE_CORE_JS)
+        html = html.replace('__BLE_CONFIG__', self._json_safe(config))
         html = html.replace('__BLE_LABELS__', self._json_safe(self._labels))
 
         return ContentFile(html.encode('utf-8'), name='ble-labels.html')
@@ -246,6 +336,302 @@ class BLELabelPrinter(LabelPrintingMixin, SettingsMixin, InvenTreePlugin):
     def _json_safe(data):
         """Serialize to JSON, safe for embedding inside a <script> tag."""
         return json.dumps(data).replace('<', '\\u003c')
+
+
+# --------------------------------------------------------------------------
+# Protocol / transport core (pure JavaScript, no DOM dependency)
+# --------------------------------------------------------------------------
+
+BLE_CORE_JS = r"""
+(function (root) {
+  'use strict';
+
+  const ESC = 0x1b, GS = 0x1d, FF = 0x0c;
+
+  function sleep(ms) {
+    return new Promise(function (resolve) { setTimeout(resolve, Math.max(0, ms | 0)); });
+  }
+
+  // ---- image mapping ---------------------------------------------------
+  function fillMap(px, py, w, h, dotsX, dotsY, mode) {
+    let sx, sy;
+    if (mode === 'fit') {
+      const s = Math.min(dotsX / w, dotsY / h);
+      sx = (px - (dotsX - w * s) / 2) / s;
+      sy = (py - (dotsY - h * s) / 2) / s;
+    } else if (mode === 'fill') {
+      const s = Math.max(dotsX / w, dotsY / h);
+      sx = (px - (dotsX - w * s) / 2) / s;
+      sy = (py - (dotsY - h * s) / 2) / s;
+    } else if (mode === 'center') {
+      sx = px - (dotsX - w) / 2;
+      sy = py - (dotsY - h) / 2;
+    } else if (mode === 'tile') {
+      sx = ((px % w) + w) % w;
+      sy = ((py % h) + h) % h;
+    } else {
+      // stretch (default)
+      sx = px * w / dotsX;
+      sy = py * h / dotsY;
+    }
+    const ix = Math.floor(sx), iy = Math.floor(sy);
+    if (ix < 0 || ix >= w || iy < 0 || iy >= h) return null;
+    return { sx: ix, sy: iy };
+  }
+
+  function renderRaster(gray, w, h, p) {
+    const dotsX = Math.max(1, Math.round(p.width_mm / 25.4 * p.dpi));
+    const dotsY = Math.max(1, Math.round(p.height_mm / 25.4 * p.dpi));
+    const bytesPerRow = Math.ceil(dotsX / 8);
+    const offY = Math.round((p.offset_y || 0) / 25.4 * p.dpi);
+    const raster = new Uint8Array(bytesPerRow * dotsY);
+
+    for (let y = 0; y < dotsY; y++) {
+      const py = y - offY;
+      for (let x = 0; x < dotsX; x++) {
+        let isWhite = true;
+        if (py >= 0 && py < dotsY) {
+          const m = fillMap(x, py, w, h, dotsX, dotsY, p.fill);
+          if (m) isWhite = gray[m.sy * w + m.sx] >= p.threshold;
+        }
+        let bit = isWhite ? 0 : 1;
+        if (p.invert) bit = 1 - bit;
+        if (bit) raster[y * bytesPerRow + (x >> 3)] |= 0x80 >> (x & 7);
+      }
+    }
+
+    return { raster: raster, dotsX: dotsX, dotsY: dotsY, bytesPerRow: bytesPerRow };
+  }
+
+  function padLeft(raster, bytesPerRow, dotsY, offX) {
+    const dotsX = bytesPerRow * 8;
+    const newDotsX = dotsX + offX;
+    const newBytesPerRow = Math.ceil(newDotsX / 8);
+    const out = new Uint8Array(newBytesPerRow * dotsY);
+    for (let y = 0; y < dotsY; y++) {
+      for (let x = 0; x < dotsX; x++) {
+        const bit = (raster[y * bytesPerRow + (x >> 3)] >> (7 - (x & 7))) & 1;
+        if (bit) {
+          const nx = x + offX;
+          out[y * newBytesPerRow + (nx >> 3)] |= 0x80 >> (nx & 7);
+        }
+      }
+    }
+    return { raster: out, bytesPerRow: newBytesPerRow, dotsX: newDotsX };
+  }
+
+  // ---- ESC/POS ---------------------------------------------------------
+  function escPosBitmap(raster, bytesPerRow, rowStart, rows) {
+    const size = 8 + bytesPerRow * rows;
+    const out = new Uint8Array(size);
+    out[0] = GS; out[1] = 0x76; out[2] = 0x30; out[3] = 0x00;  // GS v 0 m
+    out[4] = bytesPerRow & 0xff;
+    out[5] = (bytesPerRow >> 8) & 0xff;
+    out[6] = rows & 0xff;
+    out[7] = (rows >> 8) & 0xff;
+    out.set(raster.subarray(rowStart * bytesPerRow, (rowStart + rows) * bytesPerRow), 8);
+    return out;
+  }
+
+  function escPosFeedSegments(feedDots) {
+    if (feedDots <= 0) return [Uint8Array.of(FF)];
+    const segs = [];
+    let d = feedDots;
+    while (d > 0) {
+      const n = Math.min(d, 255);
+      segs.push(Uint8Array.of(ESC, 0x4a, n));  // ESC J n
+      d -= n;
+    }
+    return segs;
+  }
+
+  function buildEscPosLabel(r, p) {
+    const offX = Math.max(0, Math.round((p.offset_x || 0) / 25.4 * p.dpi));
+    const padded = offX > 0
+      ? padLeft(r.raster, r.bytesPerRow, r.dotsY, offX)
+      : { raster: r.raster, bytesPerRow: r.bytesPerRow, dotsX: r.dotsX };
+
+    const bandRows = Math.max(0, Math.round(p.band_rows || 0));
+    const segs = [];
+    if (bandRows > 0 && bandRows < r.dotsY) {
+      for (let y = 0; y < r.dotsY; y += bandRows) {
+        segs.push(escPosBitmap(padded.raster, padded.bytesPerRow, y,
+          Math.min(bandRows, r.dotsY - y)));
+      }
+    } else {
+      segs.push(escPosBitmap(padded.raster, padded.bytesPerRow, 0, r.dotsY));
+    }
+    const feedDots = Math.round((p.feed_mm || 0) / 25.4 * p.dpi);
+    Array.prototype.push.apply(segs, escPosFeedSegments(feedDots));
+    return segs;
+  }
+
+  // ---- TSPL2 -----------------------------------------------------------
+  function buildTsplLabel(r, p) {
+    const offX = Math.max(0, Math.round((p.offset_x || 0) / 25.4 * p.dpi));
+    const gap = (p.gap_mm === undefined || p.gap_mm === null) ? 2 : p.gap_mm;
+    const header = 'SIZE ' + p.width_mm + ' mm,' + p.height_mm + ' mm\r\n' +
+                   'GAP ' + gap + ' mm,0 mm\r\nDIRECTION 1\r\nCLS\r\n' +
+                   'BITMAP ' + offX + ',0,' + r.bytesPerRow + ',' + r.dotsY + ',0,';
+    const hdr = new TextEncoder().encode(header);
+    const tail = new TextEncoder().encode('\r\nPRINT 1,1\r\n');
+    const out = new Uint8Array(hdr.length + r.raster.length + tail.length);
+    out.set(hdr, 0);
+    out.set(r.raster, hdr.length);
+    out.set(tail, hdr.length + r.raster.length);
+    return out;
+  }
+
+  // ---- RAW -------------------------------------------------------------
+  function buildRawLabel(r, p) {
+    // A raw bitmap still needs a form feed, otherwise consecutive labels are
+    // printed as one endless bitmap.
+    const offX = Math.max(0, Math.round((p.offset_x || 0) / 25.4 * p.dpi));
+    const padded = offX > 0
+      ? padLeft(r.raster, r.bytesPerRow, r.dotsY, offX)
+      : { raster: r.raster };
+    return [padded.raster, Uint8Array.of(FF)];
+  }
+
+  // ---- job assembly ----------------------------------------------------
+  function buildJob(rasters, p) {
+    const proto = String(p.protocol || 'ESC/POS').toUpperCase();
+    const labels = rasters.map(function (r) {
+      if (proto === 'TSPL2') return [buildTsplLabel(r, p)];
+      if (proto === 'RAW') return buildRawLabel(r, p);
+      return buildEscPosLabel(r, p);
+    });
+    // ESC @ is sent once per job.  Never inject it between labels: it clears
+    // the print buffer and would truncate the label currently being printed.
+    const init = proto === 'TSPL2' ? new Uint8Array(0) : Uint8Array.of(ESC, 0x40);
+    return { init: init, labels: labels, protocol: proto };
+  }
+
+  function jobBytes(job) {
+    let n = job.init ? job.init.length : 0;
+    job.labels.forEach(function (segs) {
+      segs.forEach(function (s) { n += s.length; });
+    });
+    return n;
+  }
+
+  // ---- BLE transport ---------------------------------------------------
+  function resolveWriteMode(char, requested) {
+    const props = (char && char.properties) || {};
+    const canWrite = !!props.write;
+    const canNoAck = !!props.writeWithoutResponse;
+    const req = String(requested || 'auto').toLowerCase();
+    if (req === 'ack') return canWrite ? 'ack' : 'noack';
+    if (req === 'noack') return canNoAck ? 'noack' : 'ack';
+    return canWrite ? 'ack' : 'noack';
+  }
+
+  async function writeData(char, data, opts) {
+    const mode = opts.mode;
+    const chunk = Math.max(16, Math.min(512, opts.chunkSize || 180));
+    const delay = Math.max(0, opts.delay | 0);
+    let sent = 0;
+    for (let i = 0; i < data.length; i += chunk) {
+      const part = data.subarray(i, i + chunk);
+      if (mode === 'noack') {
+        await char.writeValueWithoutResponse(part);
+      } else {
+        await char.writeValue(part);
+      }
+      sent += part.length;
+      if (delay > 0 && i + chunk < data.length) await sleep(delay);
+    }
+    return sent;
+  }
+
+  async function sendJob(spec) {
+    const char = spec.char;
+    const job = spec.job;
+    const p = spec.p || {};
+    const onProgress = spec.onProgress;
+    const mode = resolveWriteMode(char, p.write_mode);
+    let completedLabels = 0;
+
+    const run = async function (writeMode) {
+      // Without ACKs there is no flow control at all, so use a conservative
+      // chunk size / delay even if the user configured something faster.
+      const noAck = writeMode === 'noack';
+      const wopts = {
+        mode: writeMode,
+        chunkSize: noAck ? Math.min(p.chunk_size || 180, 100) : p.chunk_size,
+        delay: noAck ? Math.max(p.chunk_delay || 0, 30) : p.chunk_delay
+      };
+      const t0 = Date.now();
+      let total = 0;
+
+      if (!p.reset_each_label && job.init && job.init.length) {
+        total += await writeData(char, job.init, wopts);
+        await sleep(80);  // let the printer settle after ESC @
+      }
+
+      for (let i = 0; i < job.labels.length; i++) {
+        const labelStart = Date.now();
+        if (p.reset_each_label && job.init && job.init.length) {
+          total += await writeData(char, job.init, wopts);
+          await sleep(80);
+        }
+        let labelBytes = 0;
+        const segs = job.labels[i];
+        for (let s = 0; s < segs.length; s++) {
+          labelBytes += await writeData(char, segs[s], wopts);
+        }
+        total += labelBytes;
+        completedLabels = i + 1;
+        if (onProgress) {
+          onProgress(i + 1, job.labels.length, {
+            bytes: labelBytes,
+            ms: Date.now() - labelStart
+          });
+        }
+        if (i < job.labels.length - 1) {
+          await sleep(Math.max(0, p.inter_label_delay | 0));
+        }
+      }
+
+      return { bytes: total, ms: Date.now() - t0, mode: writeMode };
+    };
+
+    try {
+      return await run(mode);
+    } catch (err) {
+      // Some printers do not support ATT long writes.  If the very first
+      // bitmap write fails before any label was completed, retry the whole
+      // job with write-without-response.  The retry starts with ESC @ again,
+      // which clears any partially buffered bitmap.
+      const props = (char && char.properties) || {};
+      if (mode === 'ack' && props.writeWithoutResponse && completedLabels === 0) {
+        const result = await run('noack');
+        result.fallback = 'noack';
+        return result;
+      }
+      throw err;
+    }
+  }
+
+  root.BLEPrintCore = {
+    ESC: ESC, GS: GS, FF: FF,
+    sleep: sleep,
+    fillMap: fillMap,
+    renderRaster: renderRaster,
+    padLeft: padLeft,
+    escPosBitmap: escPosBitmap,
+    escPosFeedSegments: escPosFeedSegments,
+    buildEscPosLabel: buildEscPosLabel,
+    buildTsplLabel: buildTsplLabel,
+    buildRawLabel: buildRawLabel,
+    buildJob: buildJob,
+    jobBytes: jobBytes,
+    resolveWriteMode: resolveWriteMode,
+    writeData: writeData,
+    sendJob: sendJob
+  };
+})(typeof globalThis !== 'undefined' ? globalThis : this);
+"""
 
 
 # --------------------------------------------------------------------------
@@ -277,6 +663,7 @@ BLE_PRINT_PAGE = """<!DOCTYPE html>
   #disconnect { background: #e5e7eb; color: #111; }
   #test-feed { background: #f59e0b; color: #fff; }
   #save-params { background: #6b7280; color: #fff; }
+  #export-bin { background: #7c3aed; color: #fff; }
   input[type=number] { width: 100%; }
   .labels { display: flex; flex-wrap: wrap; gap: 16px; }
   .label { text-align: center; }
@@ -306,6 +693,7 @@ BLE_PRINT_PAGE = """<!DOCTYPE html>
       <label>水平偏移 (mm) <input id="p-offx" type="number" step="0.1"></label>
       <label>垂直偏移 (mm) <input id="p-offy" type="number" step="0.1"></label>
       <label>走纸 (mm, 0=间隙自动) <input id="p-feed" type="number" step="0.1"></label>
+      <label>标签间隙 (TSPL, mm) <input id="p-gap" type="number" step="0.1"></label>
       <label>DPI <input id="p-dpi" type="number"></label>
       <label>阈值 <input id="p-thr" type="number"></label>
       <label>协议
@@ -324,7 +712,19 @@ BLE_PRINT_PAGE = """<!DOCTYPE html>
           <option value="tile">平铺</option>
         </select>
       </label>
+      <label>BLE 写入模式
+        <select id="p-writemode">
+          <option value="auto">自动（优先应答）</option>
+          <option value="ack">应答写入 (with response)</option>
+          <option value="noack">无应答写入 (without response)</option>
+        </select>
+      </label>
+      <label>块大小 (字节) <input id="p-chunk" type="number" min="16" max="512"></label>
+      <label>块间延迟 (ms) <input id="p-chunkdelay" type="number" min="0"></label>
+      <label>标签间隔 (ms) <input id="p-labeldelay" type="number" min="0"></label>
+      <label>分段行数 (0=整张) <input id="p-bandrows" type="number" min="0"></label>
       <label class="check"><input id="p-invert" type="checkbox"> 反色</label>
+      <label class="check"><input id="p-reset" type="checkbox"> 每张前复位 ESC @（旧行为，可能截断）</label>
     </div>
   </div>
 
@@ -344,6 +744,7 @@ BLE_PRINT_PAGE = """<!DOCTYPE html>
     <div class="row" style="margin-top:12px;">
       <label>份数 <input id="copies" type="number" min="1" value="1" style="width:70px;"></label>
       <button id="print" disabled>打印</button>
+      <button id="export-bin" disabled>导出指令流 (.bin)</button>
     </div>
     <div id="status"></div>
   </div>
@@ -354,10 +755,14 @@ BLE_PRINT_PAGE = """<!DOCTYPE html>
   </div>
 
 <script>
+__BLE_CORE_JS__
+</script>
+<script>
 'use strict';
 
 const CONFIG = __BLE_CONFIG__;
 const LABELS = __BLE_LABELS__;
+const Core = window.BLEPrintCore;
 
 const $ = (id) => document.getElementById(id);
 const status = (msg, cls) => { const el = $('status'); el.textContent = msg; el.className = cls || ''; };
@@ -368,11 +773,18 @@ $('p-height').value = CONFIG.height_mm;
 $('p-offx').value = CONFIG.offset_x;
 $('p-offy').value = CONFIG.offset_y;
 $('p-feed').value = CONFIG.feed_mm;
+$('p-gap').value = CONFIG.gap_mm;
 $('p-dpi').value = CONFIG.dpi;
 $('p-thr').value = CONFIG.threshold;
 $('p-proto').value = CONFIG.protocol;
 $('p-invert').checked = !!CONFIG.invert;
 $('p-fill').value = CONFIG.fill_mode || 'stretch';
+$('p-writemode').value = CONFIG.write_mode || 'auto';
+$('p-chunk').value = CONFIG.chunk_size;
+$('p-chunkdelay').value = CONFIG.chunk_delay;
+$('p-labeldelay').value = CONFIG.inter_label_delay;
+$('p-bandrows').value = CONFIG.band_rows;
+$('p-reset').checked = !!CONFIG.reset_each_label;
 
 // Restore previously saved parameters (client-side persistence)
 loadSavedParams();
@@ -384,17 +796,27 @@ function getParams() {
     offset_x: parseFloat($('p-offx').value) || 0,
     offset_y: parseFloat($('p-offy').value) || 0,
     feed_mm: parseFloat($('p-feed').value) || 0,
+    gap_mm: parseFloat($('p-gap').value) || 0,
     dpi: parseInt($('p-dpi').value) || 203,
     threshold: parseInt($('p-thr').value) || 128,
     invert: $('p-invert').checked,
     protocol: $('p-proto').value,
-    fill: $('p-fill').value
+    fill: $('p-fill').value,
+    write_mode: $('p-writemode').value,
+    chunk_size: parseInt($('p-chunk').value) || 180,
+    chunk_delay: parseInt($('p-chunkdelay').value) || 0,
+    inter_label_delay: parseInt($('p-labeldelay').value) || 0,
+    band_rows: parseInt($('p-bandrows').value) || 0,
+    reset_each_label: $('p-reset').checked
   };
 }
 
+// v2 key: v0.4.x stored chunk_size=200 / chunk_delay=15 here, which would
+// silently override the new, safer defaults. Old entries are intentionally
+// ignored; calibration values also live in the plugin settings on the server.
 function loadSavedParams() {
   try {
-    const raw = localStorage.getItem('ble-label-printer-params');
+    const raw = localStorage.getItem('ble-label-printer-params-v2');
     if (!raw) return false;
     const s = JSON.parse(raw);
     if (!s || typeof s !== 'object') return false;
@@ -403,11 +825,18 @@ function loadSavedParams() {
     if (s.offset_x != null) $('p-offx').value = s.offset_x;
     if (s.offset_y != null) $('p-offy').value = s.offset_y;
     if (s.feed_mm != null) $('p-feed').value = s.feed_mm;
+    if (s.gap_mm != null) $('p-gap').value = s.gap_mm;
     if (s.dpi != null) $('p-dpi').value = s.dpi;
     if (s.threshold != null) $('p-thr').value = s.threshold;
     if (s.invert != null) $('p-invert').checked = !!s.invert;
     if (s.protocol) $('p-proto').value = s.protocol;
     if (s.fill) $('p-fill').value = s.fill;
+    if (s.write_mode) $('p-writemode').value = s.write_mode;
+    if (s.chunk_size != null) $('p-chunk').value = s.chunk_size;
+    if (s.chunk_delay != null) $('p-chunkdelay').value = s.chunk_delay;
+    if (s.inter_label_delay != null) $('p-labeldelay').value = s.inter_label_delay;
+    if (s.band_rows != null) $('p-bandrows').value = s.band_rows;
+    if (s.reset_each_label != null) $('p-reset').checked = !!s.reset_each_label;
     return true;
   } catch (e) {
     return false;
@@ -418,7 +847,7 @@ async function saveParams() {
   const p = getParams();
   // Always persist to this browser
   try {
-    localStorage.setItem('ble-label-printer-params', JSON.stringify(p));
+    localStorage.setItem('ble-label-printer-params-v2', JSON.stringify(p));
   } catch (e) {}
 
   // Also persist to the plugin settings (server side)
@@ -429,9 +858,16 @@ async function saveParams() {
     OFFSET_X: String(p.offset_x),
     OFFSET_Y: String(p.offset_y),
     FEED_MM: String(p.feed_mm),
+    GAP_MM: String(p.gap_mm),
     THRESHOLD: String(p.threshold),
     INVERT: p.invert ? 'True' : 'False',
-    FILL_MODE: p.fill
+    FILL_MODE: p.fill,
+    WRITE_MODE: p.write_mode,
+    WRITE_CHUNK_SIZE: String(p.chunk_size),
+    WRITE_CHUNK_DELAY: String(p.chunk_delay),
+    INTER_LABEL_DELAY: String(p.inter_label_delay),
+    BAND_ROWS: String(p.band_rows),
+    RESET_EACH_LABEL: p.reset_each_label ? 'True' : 'False'
   };
 
   let ok = true;
@@ -496,9 +932,9 @@ const STANDARD_SERVICES = [
 function rankChar(c, serviceUuid) {
   const s = normalizeUuid(serviceUuid);
   let rank = 0;
-  if (c.properties.writeWithoutResponse && c.properties.write) rank = 30;
+  if (c.properties.write && c.properties.writeWithoutResponse) rank = 30;
+  else if (c.properties.write) rank = 25;              // preferred: ACKed writes
   else if (c.properties.writeWithoutResponse) rank = 20;
-  else if (c.properties.write) rank = 10;
   if (c.properties.notify) rank += 5;
   if (!STANDARD_SERVICES.includes(s)) rank += 2;
   return rank;
@@ -518,127 +954,15 @@ async function loadGrayscale(b64) {
   return { gray, w: img.width, h: img.height };
 }
 
-// ---- rendering ----
-function fillMap(px, py, w, h, dotsX, dotsY, mode) {
-  let sx, sy;
-  if (mode === 'fit') {
-    const s = Math.min(dotsX / w, dotsY / h);
-    sx = (px - (dotsX - w * s) / 2) / s;
-    sy = (py - (dotsY - h * s) / 2) / s;
-  } else if (mode === 'fill') {
-    const s = Math.max(dotsX / w, dotsY / h);
-    sx = (px - (dotsX - w * s) / 2) / s;
-    sy = (py - (dotsY - h * s) / 2) / s;
-  } else if (mode === 'center') {
-    sx = px - (dotsX - w) / 2;
-    sy = py - (dotsY - h) / 2;
-  } else if (mode === 'tile') {
-    sx = ((px % w) + w) % w;
-    sy = ((py % h) + h) % h;
-  } else {
-    // stretch (default)
-    sx = px * w / dotsX;
-    sy = py * h / dotsY;
-  }
-  const ix = Math.floor(sx), iy = Math.floor(sy);
-  if (ix < 0 || ix >= w || iy < 0 || iy >= h) return null;
-  return { sx: ix, sy: iy };
-}
-
-function renderRaster(gray, w, h, p) {
-  const dotsX = Math.max(1, Math.round(p.width_mm / 25.4 * p.dpi));
-  const dotsY = Math.max(1, Math.round(p.height_mm / 25.4 * p.dpi));
-  const bytesPerRow = Math.ceil(dotsX / 8);
-  const offY = Math.round(p.offset_y / 25.4 * p.dpi);
-  const raster = new Uint8Array(bytesPerRow * dotsY);
-
-  for (let y = 0; y < dotsY; y++) {
-    const py = y - offY;
-    for (let x = 0; x < dotsX; x++) {
-      let isWhite = true;
-      if (py >= 0 && py < dotsY) {
-        const m = fillMap(x, py, w, h, dotsX, dotsY, p.fill);
-        if (m) {
-          isWhite = gray[m.sy * w + m.sx] >= p.threshold;
-        }
-      }
-      let bit = isWhite ? 0 : 1;
-      if (p.invert) bit = 1 - bit;
-      if (bit) raster[y * bytesPerRow + (x >> 3)] |= 0x80 >> (x & 7);
-    }
-  }
-
-  return { raster, dotsX, dotsY, bytesPerRow };
-}
-
-function encodeEscPos(raster, dotsX, dotsY, bytesPerRow, feedDots) {
-  const xL = bytesPerRow & 0xFF, xH = (bytesPerRow >> 8) & 0xFF;
-  const yL = dotsY & 0xFF, yH = (dotsY >> 8) & 0xFF;
-  const out = [0x1b, 0x40, 0x1d, 0x76, 0x30, 0x00, xL, xH, yL, yH];
-  for (let i = 0; i < raster.length; i++) out.push(raster[i]);
-  if (feedDots <= 0) {
-    out.push(0x0c);  // FF (form feed): advance to the next label using the gap sensor
-  } else {
-    let d = feedDots;
-    while (d > 0) { const n = Math.min(d, 255); out.push(0x1b, 0x4a, n); d -= n; }
-  }
-  return new Uint8Array(out);
-}
-
-function encodeTspl(raster, dotsX, dotsY, bytesPerRow, p, offX) {
-  const header = 'SIZE ' + p.width_mm + ' mm,' + p.height_mm + ' mm\\r\\n' +
-                 'GAP 0 mm,0 mm\\r\\nDIRECTION 1\\r\\nCLS\\r\\n' +
-                 'BITMAP ' + offX + ',0,' + bytesPerRow + ',' + dotsY + ',0,';
-  const hdr = new TextEncoder().encode(header);
-  const tail = new TextEncoder().encode('\\r\\nPRINT 1,1\\r\\n');
-  const out = new Uint8Array(hdr.length + raster.length + tail.length);
-  out.set(hdr, 0);
-  out.set(raster, hdr.length);
-  out.set(tail, hdr.length + raster.length);
-  return out;
-}
-
-function padLeft(raster, bytesPerRow, dotsY, offX) {
-  const dotsX = bytesPerRow * 8;
-  const newDotsX = dotsX + offX;
-  const newBytesPerRow = Math.ceil(newDotsX / 8);
-  const out = new Uint8Array(newBytesPerRow * dotsY);
-  for (let y = 0; y < dotsY; y++) {
-    for (let x = 0; x < dotsX; x++) {
-      const bit = (raster[y * bytesPerRow + (x >> 3)] >> (7 - (x & 7))) & 1;
-      if (bit) {
-        const nx = x + offX;
-        out[y * newBytesPerRow + (nx >> 3)] |= 0x80 >> (nx & 7);
-      }
-    }
-  }
-  return { raster: out, bytesPerRow: newBytesPerRow, dotsX: newDotsX };
-}
-
-function encodePayload(r, p) {
-  const offX = Math.max(0, Math.round(p.offset_x / 25.4 * p.dpi));
-  const proto = (p.protocol || 'ESC/POS').toUpperCase();
-  if (proto === 'TSPL2') return encodeTspl(r.raster, r.dotsX, r.dotsY, r.bytesPerRow, p, offX);
-  const padded = offX > 0
-    ? padLeft(r.raster, r.bytesPerRow, r.dotsY, offX)
-    : { raster: r.raster, bytesPerRow: r.bytesPerRow, dotsX: r.dotsX };
-  if (proto === 'RAW') return padded.raster;
-  const feedDots = Math.round(p.feed_mm / 25.4 * p.dpi);
-  return encodeEscPos(padded.raster, padded.dotsX, r.dotsY, padded.bytesPerRow, feedDots);
-}
-
 // ---- state ----
 let device = null, selectedChar = null, writableChars = [];
 let loadedLabels = [];   // [{filename, gray, w, h}]
-let rendered = [];       // [{raster, dotsX, dotsY, bytesPerRow, payload}]
+let rendered = [];       // [{raster, dotsX, dotsY, bytesPerRow}]
 
 function refresh() {
   const p = getParams();
-  rendered = loadedLabels.map(l => {
-    const r = renderRaster(l.gray, l.w, l.h, p);
-    r.payload = encodePayload(r, p);
-    return r;
-  });
+  rendered = loadedLabels.map(l => Core.renderRaster(l.gray, l.w, l.h, p));
+  $('export-bin').disabled = !rendered.length;
 }
 
 // Preview shows the original InvenTree-rendered label (not the calibrated output)
@@ -713,7 +1037,9 @@ async function connect() {
       selectedChar = writableChars[0].characteristic;
     }
 
-    $('dev-status').textContent = '已连接: ' + (device.name || device.id) + ' (id: ' + device.id + ')';
+    const mode = selectedChar ? Core.resolveWriteMode(selectedChar, getParams().write_mode) : '';
+    $('dev-status').textContent = '已连接: ' + (device.name || device.id) +
+      (mode ? '（写入模式: ' + mode + '）' : '');
     $('connect').disabled = true;
     $('disconnect').disabled = false;
     $('char-select').disabled = false;
@@ -736,19 +1062,15 @@ async function disconnect() {
   $('test-feed').disabled = true;
 }
 
-function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+const sleep = Core.sleep;
 
-async function writeBytes(data) {
-  const chunk = Math.max(16, CONFIG.chunkSize || 200);
-  for (let i = 0; i < data.length; i += chunk) {
-    const part = data.slice(i, i + chunk);
-    if (selectedChar.properties.writeWithoutResponse) {
-      await selectedChar.writeValueWithoutResponse(part);
-    } else {
-      await selectedChar.writeValue(part);
-    }
-    if (CONFIG.chunkDelay > 0) await sleep(CONFIG.chunkDelay);
-  }
+async function writeRaw(data) {
+  // Used by the "test feed" button only.
+  const p = getParams();
+  const mode = Core.resolveWriteMode(selectedChar, p.write_mode);
+  await Core.writeData(selectedChar, data, {
+    mode: mode, chunkSize: p.chunk_size, delay: p.chunk_delay
+  });
 }
 
 async function testFeed() {
@@ -766,33 +1088,66 @@ async function testFeed() {
       while (d > 0) { const n = Math.min(d, 255); out.push(0x1b, 0x4a, n); d -= n; }
       msg = '已发送走纸指令（' + p.feed_mm + ' mm），观察打印机是否走纸。';
     }
-    await writeBytes(new Uint8Array(out));
+    await writeRaw(new Uint8Array(out));
     status(msg, 'ok');
   } catch (e) {
     status('走纸指令发送失败: ' + (e.message || e), 'error');
   }
 }
 
+function buildCurrentJob(copies) {
+  const p = getParams();
+  const rasters = [];
+  for (let c = 0; c < copies; c++) {
+    for (const r of rendered) rasters.push(r);
+  }
+  return { p, job: Core.buildJob(rasters, p) };
+}
+
 async function print() {
   if (!selectedChar) { status('请先连接打印机。', 'error'); return; }
   const copies = Math.max(1, parseInt($('copies').value || '1', 10));
-  const total = rendered.length * copies;
-  let done = 0;
+  const built = buildCurrentJob(copies);
+  const p = built.p, job = built.job;
   try {
     $('print').disabled = true;
-    for (let c = 0; c < copies; c++) {
-      for (const r of rendered) {
-        status('正在打印 ' + (done + 1) + '/' + total + ' ...');
-        await writeBytes(r.payload);
-        done++;
+    $('export-bin').disabled = true;
+    const lines = [];
+    const result = await Core.sendJob({
+      char: selectedChar,
+      job: job,
+      p: p,
+      onProgress: (done, total, info) => {
+        lines.push('标签 ' + done + '/' + total + ': ' + info.bytes + ' 字节, ' + info.ms + ' ms');
+        status('正在打印 ' + done + '/' + total + ' ...\\n' + lines.slice(-4).join('\\n'));
       }
-    }
-    status('打印完成，共 ' + total + ' 张标签。', 'ok');
+    });
+    lines.push('总计 ' + result.bytes + ' 字节, ' + (result.ms / 1000).toFixed(1) + ' s, 写入模式 ' + result.mode +
+      (result.fallback ? '（打印机不支持长写，已自动降级）' : ''));
+    status('打印完成，共 ' + job.labels.length + ' 张标签。\\n' + lines.slice(-6).join('\\n'), 'ok');
   } catch (e) {
-    status('打印出错: ' + (e.message || e), 'error');
+    status('打印出错: ' + (e.message || e) + '\\n已发送的标签可能不完整，请检查后重试。', 'error');
   } finally {
     $('print').disabled = false;
+    $('export-bin').disabled = !rendered.length;
   }
+}
+
+function exportBin() {
+  const copies = Math.max(1, parseInt($('copies').value || '1', 10));
+  const built = buildCurrentJob(copies);
+  const job = built.job;
+  let size = Core.jobBytes(job);
+  const buf = new Uint8Array(size);
+  let off = 0;
+  if (job.init && job.init.length) { buf.set(job.init, off); off += job.init.length; }
+  job.labels.forEach(segs => segs.forEach(s => { buf.set(s, off); off += s.length; }));
+  const blob = new Blob([buf], { type: 'application/octet-stream' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = 'ble-labels-' + built.p.protocol.replace('/', '-') + '.bin';
+  a.click();
+  status('已导出 ' + size + ' 字节指令流（' + job.labels.length + ' 张标签）。', 'ok');
 }
 
 // ---- wire up events ----
@@ -801,12 +1156,15 @@ $('disconnect').addEventListener('click', disconnect);
 $('print').addEventListener('click', print);
 $('test-feed').addEventListener('click', testFeed);
 $('save-params').addEventListener('click', saveParams);
+$('export-bin').addEventListener('click', exportBin);
 $('char-select').addEventListener('change', (ev) => {
   const idx = parseInt(ev.target.value, 10);
   if (!isNaN(idx) && writableChars[idx]) selectedChar = writableChars[idx].characteristic;
 });
 
-['p-width', 'p-height', 'p-offx', 'p-offy', 'p-feed', 'p-dpi', 'p-thr', 'p-proto', 'p-fill'].forEach(id => {
+['p-width', 'p-height', 'p-offx', 'p-offy', 'p-feed', 'p-gap', 'p-dpi', 'p-thr',
+ 'p-proto', 'p-fill', 'p-writemode', 'p-chunk', 'p-chunkdelay', 'p-labeldelay',
+ 'p-bandrows'].forEach(id => {
   $(id).addEventListener('input', refresh);
 });
 $('p-invert').addEventListener('change', refresh);
